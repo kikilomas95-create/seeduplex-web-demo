@@ -94,31 +94,43 @@ let currentTurn = null;
 let lastTurn = null;
 let pcmPlayer = null;
 let audioUnlockContext = null;
+let iosAudioElement = null;
+const IOS_SILENT_WAV =
+  "data:audio/wav;base64,UklGRsQAAABXQVZFZm10IBAAAAABAAEAQB8AAIA+AAACABAAZGF0YaAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
 
-async function unlockAudioForIOS() {
+function unlockAudioForIOS() {
   try {
-    if (!audioUnlockContext || audioUnlockContext.state === "closed") {
-      audioUnlockContext = new AudioContext();
+    const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+    if (AudioContextClass && (!audioUnlockContext || audioUnlockContext.state === "closed")) {
+      audioUnlockContext = new AudioContextClass();
     }
 
-    if (audioUnlockContext.state === "suspended") {
-      await audioUnlockContext.resume();
+    if (audioUnlockContext && audioUnlockContext.state === "suspended") {
+      // This function is called directly from the user's tap. Do not defer
+      // this call with setTimeout/requestAnimationFrame.
+      audioUnlockContext.resume().catch(() => {});
     }
 
-    // Create a silent buffer and start it during the user gesture.
-    // This unlocks audio playback on iOS Safari.
-    const buffer = audioUnlockContext.createBuffer(1, 1, 22050);
-    const sourceNode = audioUnlockContext.createBufferSource();
-    sourceNode.buffer = buffer;
-    sourceNode.connect(audioUnlockContext.destination);
-    sourceNode.start(0);
+    if (!iosAudioElement) {
+      iosAudioElement = new Audio();
+      iosAudioElement.setAttribute("playsinline", "");
+      iosAudioElement.playsInline = true;
+      iosAudioElement.preload = "auto";
+      iosAudioElement.src = IOS_SILENT_WAV;
+      iosAudioElement.volume = 0.001;
+    }
 
+    const playPromise = iosAudioElement.play();
+    if (playPromise && typeof playPromise.catch === "function") {
+      playPromise.catch(() => {});
+    }
     return true;
   } catch (err) {
     console.warn("Audio unlock failed:", err);
     return false;
   }
 }
+
 let mediaStream = null;
 let recorderContext = null;
 let recorderNode = null;
@@ -2356,19 +2368,14 @@ class PcmStreamPlayer {
   }
 
   async start() {
-  if (!this.ctx || this.ctx.state === "closed") {
-    try {
+    const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+    if (!this.ctx || this.ctx.state === "closed") {
+      // Reuse the context unlocked by the user's tap when possible.
       this.ctx = audioUnlockContext && audioUnlockContext.state !== "closed"
         ? audioUnlockContext
-        : new AudioContext({sampleRate: this.sampleRate});
-    } catch {
-      this.ctx = new AudioContext({sampleRate: this.sampleRate});
+        : new AudioContextClass({sampleRate: this.sampleRate});
     }
-  }
-
-  if (this.ctx.state === "suspended") {
-    await this.ctx.resume();
-  }
+    if (this.ctx.state === "suspended") await this.ctx.resume();
     this.nextPlayTime = Math.max(this.ctx.currentTime + 0.04, this.nextPlayTime || 0);
   }
 
@@ -2417,7 +2424,12 @@ class BufferedEncodedAudioPlayer {
     const blob = new Blob(this.chunks, {type: this.mimeType});
     this.chunks = [];
     this.objectUrl = URL.createObjectURL(blob);
-    this.audio = new Audio(this.objectUrl);
+    this.audio = iosAudioElement || new Audio();
+    this.audio.setAttribute("playsinline", "");
+    this.audio.playsInline = true;
+    this.audio.preload = "auto";
+    this.audio.volume = 1;
+    this.audio.src = this.objectUrl;
     await this.audio.play();
   }
 
@@ -2465,7 +2477,11 @@ class MediaSourceEncodedAudioPlayer {
     const Source = window.MediaSource || window.ManagedMediaSource;
     this.mediaSource = new Source();
     this.objectUrl = URL.createObjectURL(this.mediaSource);
-    this.audio = new Audio();
+    this.audio = iosAudioElement || new Audio();
+    this.audio.setAttribute("playsinline", "");
+    this.audio.playsInline = true;
+    this.audio.preload = "auto";
+    this.audio.volume = 1;
     this.audio.src = this.objectUrl;
     this.audio.autoplay = true;
     this.sourceOpenPromise = new Promise((resolve, reject) => {
@@ -2481,7 +2497,7 @@ class MediaSourceEncodedAudioPlayer {
       };
       this.mediaSource.addEventListener("sourceopen", onOpen, {once: true});
     });
-    await this.audio.play().catch(() => {});
+    await this.audio.play();
     await this.sourceOpenPromise;
   }
 
@@ -2500,7 +2516,7 @@ class MediaSourceEncodedAudioPlayer {
     }
     this.queue.push(bytes.slice());
     this.pump();
-    if (this.audio && this.audio.paused) await this.audio.play().catch(() => {});
+    if (this.audio && this.audio.paused) await this.audio.play();
   }
 
   pump() {
@@ -2612,8 +2628,11 @@ class WebCodecsOggOpusPlayer {
   }
 
   async start() {
+    const AudioContextClass = window.AudioContext || window.webkitAudioContext;
     if (!this.ctx || this.ctx.state === "closed") {
-      this.ctx = new AudioContext();
+      this.ctx = audioUnlockContext && audioUnlockContext.state !== "closed"
+        ? audioUnlockContext
+        : new AudioContextClass();
     }
     if (this.ctx.state === "suspended") await this.ctx.resume();
     this.nextPlayTime = Math.max(this.ctx.currentTime + 0.04, this.nextPlayTime || 0);
@@ -2983,6 +3002,8 @@ els.heroConnectBtn.addEventListener("click", evt => {
   evt.preventDefault();
   if (els.connectBtn.disabled) return;
   if (!requireApiKey()) return;
+  // iOS Safari requires media playback to be unlocked during the user's tap.
+  unlockAudioForIOS();
   window.clearTimeout(heroConnectTimer);
   els.heroConnectBtn.disabled = true;
   els.heroConnectBtn.classList.add("is-starting");
@@ -2996,9 +3017,9 @@ els.heroConnectBtn.addEventListener("click", evt => {
 els.connectBtn.addEventListener("click", async () => {
   if (!requireApiKey()) return;
 
-  // IMPORTANT for iPhone/iPad Safari:
-  // unlock audio while still inside the user's click gesture.
-  await unlockAudioForIOS();
+  // IMPORTANT for iPhone/iPad Safari: unlock audio while still inside
+  // the user's click gesture, before any asynchronous network work.
+  unlockAudioForIOS();
 
   try {
     keepCallPageOnDisconnect = false;
