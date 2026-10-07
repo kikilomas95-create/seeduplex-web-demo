@@ -574,22 +574,68 @@ class DuplexSession:
             })
             if self.ws.used_insecure_tls:
                 self.emit("local.warning", {"message": "Python TLS trust store rejected the upstream certificate; demo continued with certificate verification disabled."})
-            session_create = self._build_session_create()
+                        session_create = self._build_session_create()
             self.emit("local.session_create", {"event": session_create})
             self.emit("local.outgoing", {"event": session_create})
+
+            # IMPORTANT:
+            # Do NOT mark the session ready immediately after sending
+            # session.create. The upstream must first acknowledge it with
+            # a session.created event.
             self.ws.send_json(session_create)
             self._remember_sent_payload(session_create)
-            self.ready.set()
+
             while not self.closed.is_set():
                 raw = self.ws.recv_text()
+
                 try:
                     msg = json.loads(raw)
                 except json.JSONDecodeError:
                     msg = {"type": "local.unparsed", "raw": raw}
+
                 self.emit("upstream.event", {"event": msg})
-                if msg.get("type") == "response.function_call_arguments.done":
+
+                msg_type = msg.get("type")
+
+                # The session is not ready until the upstream explicitly
+                # returns session.created.
+                if msg_type == "session.created":
+                    upstream_session = msg.get("session") or {}
+                    upstream_session_id = (
+                        upstream_session.get("id")
+                        or msg.get("session_id")
+                        or self.config.get("dialog_id")
+                        or ""
+                    )
+
+                    self.emit(
+                        "local.session_ready",
+                        {
+                            "session_id": self.id,
+                            "dialog_id": upstream_session_id,
+                            "upstream_event": msg,
+                        },
+                    )
+
+                    # Only now is it safe for the browser to send audio.
+                    self.ready.set()
+
+                if msg_type == "response.function_call_arguments.done":
                     self._handle_function_call(msg)
-                if msg.get("type") in ("session.closed", "error"):
+
+                if msg_type == "error":
+                    # Keep ready unset. The frontend will receive the real
+                    # upstream error instead of repeatedly sending audio
+                    # into a session that was never ready.
+                    self.emit(
+                        "local.session_error",
+                        {
+                            "event": msg,
+                        },
+                    )
+                    break
+
+                if msg_type == "session.closed":
                     break
         except WebSocketError as exc:
             payload = exc.to_payload()
@@ -605,7 +651,6 @@ class DuplexSession:
             self.emit("local.error", {"message": str(exc)})
         finally:
             self.closed.set()
-            self.ready.set()
             if self.ws:
                 self.ws.close()
             self.emit("local.closed", {})
