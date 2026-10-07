@@ -2994,19 +2994,50 @@ els.connectBtn.addEventListener("click", async () => {
     source.onmessage = evt => {
       const msg = JSON.parse(evt.data);
       logInboundEvent(msg);
-      if (msg.type === "local.connected" && !autoMicStarted) {
+         // WebSocket is connected, but the upstream Session is NOT ready yet.
+      // Do not start the microphone here.
+      if (msg.type === "local.connected") {
+        els.recordHint.textContent = "已连接服务器，正在等待实时语音 Session 就绪";
+        setHeroState("建立会话中...", "connecting");
+      }
+
+      // Start the microphone ONLY after the upstream confirms
+      // session.created.
+      if (msg.type === "local.session_ready" && !autoMicStarted) {
         autoMicStarted = true;
+
+        const dialogId = msg.dialog_id || "";
+
+        if (dialogId) {
+          addMessage(
+            "tool",
+            `upstream session ready\ndialog_id: ${dialogId}`
+          );
+        } else {
+          addMessage("tool", "upstream session ready");
+        }
+
         setConnected(true);
+
         startRecording().catch(err => {
           recording = false;
           micMuted = true;
           clearInputAudioBuffer();
           startInputAudioFramePump();
           updateMicUi();
-          els.recordHint.textContent = "麦克风启动失败，客户端将继续每 20ms 发送静音帧";
+
+          els.recordHint.textContent =
+            "麦克风启动失败，客户端将继续每 20ms 发送静音帧";
+
           setHeroState("麦克风已关", "ok");
+
           const message = microphoneErrorMessage(err);
-          addMessage("tool", `${message}\n客户端将继续每 20ms 发送静音帧保持上行。`);
+
+          addMessage(
+            "tool",
+            `${message}\n客户端将继续每 20ms 发送静音帧保持上行。`
+          );
+
           showErrorToast("麦克风启动失败", message);
         });
       }
@@ -3030,6 +3061,24 @@ els.connectBtn.addEventListener("click", async () => {
         appendToolResult(msg);
       }
       if (msg.type === "local.warning") addMessage("tool", `warning: ${msg.message}`);
+            if (msg.type === "local.session_error") {
+        const upstreamEvent = msg.event || {};
+        const message =
+          upstreamEvent.message ||
+          upstreamEvent.error?.message ||
+          JSON.stringify(upstreamEvent, null, 2);
+
+        addMessage(
+          "tool",
+          `Session 创建失败\n${message}`
+        );
+
+        showErrorToast(
+          "实时语音 Session 创建失败",
+          message,
+          {duration: 0, endCallOnClose: true}
+        );
+      }
       if (msg.type === "local.error") {
         stopRecording({commit: false, hint: "连接已断开，实时收音已停止"}).catch(() => {});
         if (pcmPlayer) pcmPlayer.stop().catch(() => {});
