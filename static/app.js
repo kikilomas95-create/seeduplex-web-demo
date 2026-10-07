@@ -93,6 +93,32 @@ let source = null;
 let currentTurn = null;
 let lastTurn = null;
 let pcmPlayer = null;
+let audioUnlockContext = null;
+
+async function unlockAudioForIOS() {
+  try {
+    if (!audioUnlockContext || audioUnlockContext.state === "closed") {
+      audioUnlockContext = new AudioContext();
+    }
+
+    if (audioUnlockContext.state === "suspended") {
+      await audioUnlockContext.resume();
+    }
+
+    // Create a silent buffer and start it during the user gesture.
+    // This unlocks audio playback on iOS Safari.
+    const buffer = audioUnlockContext.createBuffer(1, 1, 22050);
+    const sourceNode = audioUnlockContext.createBufferSource();
+    sourceNode.buffer = buffer;
+    sourceNode.connect(audioUnlockContext.destination);
+    sourceNode.start(0);
+
+    return true;
+  } catch (err) {
+    console.warn("Audio unlock failed:", err);
+    return false;
+  }
+}
 let mediaStream = null;
 let recorderContext = null;
 let recorderNode = null;
@@ -2330,10 +2356,19 @@ class PcmStreamPlayer {
   }
 
   async start() {
-    if (!this.ctx || this.ctx.state === "closed") {
+  if (!this.ctx || this.ctx.state === "closed") {
+    try {
+      this.ctx = audioUnlockContext && audioUnlockContext.state !== "closed"
+        ? audioUnlockContext
+        : new AudioContext({sampleRate: this.sampleRate});
+    } catch {
       this.ctx = new AudioContext({sampleRate: this.sampleRate});
     }
-    if (this.ctx.state === "suspended") await this.ctx.resume();
+  }
+
+  if (this.ctx.state === "suspended") {
+    await this.ctx.resume();
+  }
     this.nextPlayTime = Math.max(this.ctx.currentTime + 0.04, this.nextPlayTime || 0);
   }
 
@@ -2960,6 +2995,11 @@ els.heroConnectBtn.addEventListener("click", evt => {
 
 els.connectBtn.addEventListener("click", async () => {
   if (!requireApiKey()) return;
+
+  // IMPORTANT for iPhone/iPad Safari:
+  // unlock audio while still inside the user's click gesture.
+  await unlockAudioForIOS();
+
   try {
     keepCallPageOnDisconnect = false;
     await stopRecording({commit: false, hint: "准备连接，实时收音已停止"}).catch(() => {});
